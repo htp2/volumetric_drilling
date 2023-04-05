@@ -45,6 +45,7 @@
 
 #include "volumetric_drilling.h"
 #include <boost/program_options.hpp>
+#include <fstream>
 
 using namespace std;
 
@@ -71,7 +72,10 @@ int afVolmetricDrillingPlugin::init(int argc, char **argv, const afWorldPtr a_af
             ("dm", p_opt::value<string>()->default_value("dark_metal_brushed.jpg"), "Drill's Matcap Filename (Should be placed in ./resources/matcap/ folder)")
             ("fp", p_opt::value<string>()->default_value("/dev/input/js0"), "Footpedal joystick input file description E.g. /dev/input/js0)")
             ("mute", p_opt::value<bool>()->default_value(false), "Mute")
-            ("gcdr", p_opt::value<double>()->default_value(30.0), "Gaze Calibration Marker Motion Duration");
+            ("gcdr", p_opt::value<double>()->default_value(30.0), "Gaze Calibration Marker Motion Duration")
+            ("vxst", p_opt::value<string>()->default_value(""), "Voxel hardness/strength spec file");
+
+    
 
     p_opt::variables_map var_map;
     p_opt::store(p_opt::command_line_parser(argc, argv).options(cmd_opts).allow_unregistered().run(), var_map);
@@ -87,6 +91,7 @@ int afVolmetricDrillingPlugin::init(int argc, char **argv, const afWorldPtr a_af
 
     string volume_matcap = var_map["vm"].as<string>();
     string footpedal_fd = var_map["fp"].as<string>();
+    m_hardness_spec_file = var_map["vxst"].as<string>();
 
     m_zeroColor = cColorb(0x00, 0x00, 0x00, 0x00);
 
@@ -156,6 +161,16 @@ int afVolmetricDrillingPlugin::init(int argc, char **argv, const afWorldPtr a_af
     m_voxelObj->m_material->setDamping(0.0);
     m_voxelObj->m_material->setDynamicFriction(0.0);
     m_voxelObj->setUseMaterial(true);
+
+    if (m_enableVoxelStrengthBehavior)
+    {
+        auto res = hardnessBehaviorInit(m_hardness_spec_file);
+        if (res != 0)
+        {
+            cerr << "ERROR! FAILED TO INITIALIZE HARDNESS BEHAVIOR" << endl;
+            return -1;
+        }
+    }
 
     initializeLabels();
 
@@ -246,7 +261,22 @@ void afVolmetricDrillingPlugin::physicsUpdate(double dt){
                 m_drillManager.m_drillingPub->clearVoxelMsg();
                 m_mutexVoxel.acquire();
                 for (int cIdx = 0 ; cIdx < removalCount ; cIdx++){
+                    // get voxel info 
                     cVector3d ct(contact->m_events[cIdx].m_voxelIndexX, contact->m_events[cIdx].m_voxelIndexY, contact->m_events[cIdx].m_voxelIndexZ);
+                    
+                    //TEMP: hardset
+                    double m_hardness_removal_rate = 0.1;
+
+                    // intercept if we don't want to remove the voxel
+                    if (m_enableVoxelStrengthBehavior)
+                    {
+                        m_voxel_hardnesses[uint(ct.x())][uint(ct.y())][uint(ct.z())] -= m_hardness_removal_rate;
+                        if (m_voxel_hardnesses[uint(ct.x())][uint(ct.y())][uint(ct.z())] > 0.0)
+                        {
+                            continue; // skips removal
+                        }
+                    }
+
                     cColorb colorb;
                     m_voxelObj->m_texture->m_image->getVoxelColor(uint(ct.x()), uint(ct.y()), uint(ct.z()), colorb);
                     cColorf colorf = colorb.getColorf();
@@ -537,6 +567,10 @@ void afVolmetricDrillingPlugin::keyboardUpdate(GLFWwindow *a_window, int a_key, 
         else if (a_key == GLFW_KEY_N){
             cerr << "INFO! RESETTING THE VOLUME" << endl;
             m_volumeObject->reset();
+            if(m_enableVoxelStrengthBehavior)
+            {
+                hardnessBehaviorInit(m_hardness_spec_file);
+            }
         }
 
         else if (a_key == GLFW_KEY_G){
@@ -834,6 +868,80 @@ void afVolmetricDrillingPlugin::mouseBtnsUpdate(GLFWwindow *a_window, int a_butt
 
 void afVolmetricDrillingPlugin::mouseScrollUpdate(GLFWwindow *a_window, double x_pos, double y_pos){
 
+}
+
+/// @brief  Initialize behavior for voxel hardnesses
+/// @param hardness_spec_file  CSV file containing hardness values for each voxel
+/// @return 0 if successful, -1 if not
+int afVolmetricDrillingPlugin::hardnessBehaviorInit(const std::string &hardness_spec_file)
+{
+    if (m_enableVoxelStrengthBehavior)
+    {
+        std::vector<std::vector<std::vector<double>>> forces(m_volumeObject->getVoxelCount().get(0), std::vector<std::vector<double>>(m_volumeObject->getVoxelCount().get(1), std::vector<double>(m_volumeObject->getVoxelCount().get(2), 1.0)));
+
+        if (hardness_spec_file == "")
+        {
+            std::cout << "[hardnessBehaviorInit]: No hardness spec file given, using default of 1.0" << std::endl;
+            m_voxel_hardnesses = forces;
+            return 0;
+        }
+
+        std::ifstream file(hardness_spec_file);
+        if (!file)
+        {
+            std::cout << "[hardnessBehaviorInit]: No such file: " << hardness_spec_file << std::endl;
+            return -1;
+        }
+
+        // read first line
+        std::string s;
+        if (!std::getline(file, s))
+        {
+            std::cout << "[hardnessBehaviorInit]: File appears to be empty: " << hardness_spec_file << std::endl;
+            return -1;
+        }
+        std::istringstream ss(s);
+        std::vector<std::string> record;
+        while (ss)
+        {
+            std::string s;
+            if (!getline(ss, s, ','))
+                break;
+            record.push_back(s);
+        }
+        // see if first line is m_volumeObject->getVoxelCount().get(0), m_volumeObject->getVoxelCount().get(1), m_volumeObject->getVoxelCount().get(2)
+        if (record.size() != 3)
+        {
+            std::cout << "[hardnessBehaviorInit]: expected hardness spec dimensionality of 3 in " << hardness_spec_file << std::endl;
+            return -1;
+        }
+        if (std::stoi(record[0]) != m_volumeObject->getVoxelCount().get(0) || std::stoi(record[1]) != m_volumeObject->getVoxelCount().get(1) || std::stoi(record[2]) != m_volumeObject->getVoxelCount().get(2))
+        {
+            std::cout << "[hardnessBehaviorInit]: expected hardness spec size of " << m_volumeObject->getVoxelCount().get(0) << ", " << m_volumeObject->getVoxelCount().get(1) << ", " << m_volumeObject->getVoxelCount().get(2) << " in " << hardness_spec_file << std::endl;
+            std::cout << "[hardnessBehaviorInit]: got " << record[0] << ", " << record[1] << ", " << record[2] << std::endl;
+            return -1;
+        }
+
+        // rest of the file is one number per line which is the hardness, loop through each dimension of harndesses
+        for (size_t i = 0; i < m_volumeObject->getVoxelCount().get(0); i++)
+        {
+            for (size_t j = 0; j < m_volumeObject->getVoxelCount().get(1); j++)
+            {
+                for (size_t k = 0; k < m_volumeObject->getVoxelCount().get(2); k++)
+                {
+                    if (!std::getline(file, s))
+                    {
+                        std::cout << "[hardnessBehaviorInit]: No data at i,j,k = " << i << "," << j << "," << k << ": " << hardness_spec_file << std::endl;
+                        return -1;
+                    }
+                    forces[i][j][k] = std::stod(s);
+                }
+            }
+        }
+        file.close();
+        m_voxel_hardnesses = forces;
+    }
+    return 0;
 }
 
 void afVolmetricDrillingPlugin::reset(){

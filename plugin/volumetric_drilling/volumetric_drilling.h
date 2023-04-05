@@ -75,6 +75,8 @@ protected:
 
     void initializeLabels();
 
+    int hardnessBehaviorInit(const std::string &hardness_spec_file);
+
     afCameraPtr findAndAppendCamera(string cam_name);
 
 private:
@@ -116,6 +118,10 @@ private:
     cColorb m_storedColor;
 
     bool m_enableVolumeSmoothing = false;
+    
+    bool m_enableVoxelStrengthBehavior = false; 
+    std::vector<std::vector<std::vector<double>>> m_voxel_hardnesses;
+    std::string m_hardness_spec_file;
 
     int m_volumeSmoothingLevel = 2;
 
